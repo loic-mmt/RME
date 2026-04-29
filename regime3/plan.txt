@@ -1,0 +1,2 @@
+Régime 3 : trend fort
+-> modèle trend-following ou filtre anti-mean-reversion
