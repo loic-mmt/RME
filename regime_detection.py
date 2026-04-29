@@ -3,6 +3,7 @@ import pandas as pd
 from pathlib import Path
 import pyarrow as pa
 import pyarrow.dataset as ds
+from sklearn.preprocessing import StandardScaler
 
 DATA_DIR = "data/cac40_daily.parquet"
 
@@ -35,6 +36,11 @@ def read_parquet_dataset(
     return table.to_pandas()
 
 
+def standardise(df):
+    scaler = StandardScaler()
+    standardised = pd.DataFrame(scaler.fit_transform(df), columns=df.columns)
+    return standardised
+
 
 def compute_returns(price_series, cols = None):
     """Create log returns for OHLCV columns."""
@@ -61,14 +67,12 @@ def compute_returns(price_series, cols = None):
     return out
 
 
-
 def compute_drawdown_series(equity_curve: pd.DataFrame) -> pd.DataFrame:
     eq = equity_curve['equity'].astype(float)
     rolling_peak = eq.cummax()
     drawdown = eq / rolling_peak - 1.0
     out = pd.DataFrame({'equity': eq, 'rolling_peak': rolling_peak, 'drawdown': drawdown}, index=equity_curve.index)
     return out
-
 
 
 def compute_benchmark(df, capital):
@@ -86,10 +90,32 @@ def compute_trend_score(returns: pd.DataFrame, window: int = 10) -> pd.DataFrame
     return score
 
 
-def train_val_test(df, split_index1, split_index2):
+def train_val_test(df, split_index1: int = 0.7, split_index2 : int = 0.85):
     split_index1 = len(df) * split_index1
     split_index2 = len(df) * split_index2
     train = df[:split_index1]
     val = df[split_index1:split_index2]
     test = df[split_index2:]
     return train, val, test
+
+
+def compute_realised_vol(returns : pd.DataFrame, window : int = 10) -> pd.DataFrame:
+    if returns is None or returns.empty:
+        return pd.DataFrame()
+    score = np.std(returns.rolling(window)) * np.sqrt(window)
+    return score
+
+
+def compute_vol_of_vol(vol : pd.DataFrame, window : int = 10) -> pd.DataFrame:
+    if vol is None or vol.empty:
+        return pd.DataFrame()
+    score = np.std(vol.rolling(window)) * np.sqrt(window)
+    return score
+
+
+def compute_correlation(returns: pd.DataFrame):
+    if returns is None or returns.empty:
+        return pd.DataFrame()
+    df = returns.groupby("ticker")
+    correlation = np.corrcoef(df)
+    return correlation
