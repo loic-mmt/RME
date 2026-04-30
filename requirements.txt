@@ -3,3 +3,5 @@ pandas
 torch
 pyarrow
 scikit-learn
+hmmlearn
+matplotlib
