@@ -5,7 +5,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from utils import merge_dataframes, read_parquet_dataset, train_val_test
-from regime_detection import HMM_FEATURES, regime_pipeline
+from regime_detection import (
+    HMM_FEATURES,
+    fit_hmm_features,
+    hmm_proba_from_model,
+    hmm_states_from_model,
+)
 from features import compute_market_features
 
 DATA_DIR = "data/cac40_daily.parquet"
@@ -51,9 +56,16 @@ def prepare_data(
     if series.empty:
         raise ValueError("Dataset vide apres filtrage.")
 
-    train, _, _ = train_val_test(series)
-    df_feat = compute_market_features(train).reset_index(drop=True)
+    series = series.sort_values("date").reset_index(drop=True)
+    train_raw, val_raw, test_raw = train_val_test(series)
+    i1 = len(train_raw)
+    i2 = i1 + len(val_raw)
+
+    df_feat = compute_market_features(series).sort_values("date").reset_index(drop=True).copy()
     df_feat["_row"] = np.arange(len(df_feat))
+    df_feat["_split"] = "test"
+    df_feat.loc[df_feat["_row"] < i1, "_split"] = "train"
+    df_feat.loc[(df_feat["_row"] >= i1) & (df_feat["_row"] < i2), "_split"] = "val"
 
     hmm_cols = [c for c in HMM_FEATURES if c in df_feat.columns and c not in {"date", "adj_close"}]
     missing = [c for c in HMM_FEATURES if c not in df_feat.columns and c not in {"date"}]
@@ -63,7 +75,13 @@ def prepare_data(
         raise ValueError("Aucune colonne HMM disponible.")
 
     hmm_input = df_feat.loc[:, hmm_cols]
-    outputs = regime_pipeline(hmm_input)
+    hmm_train_input = hmm_input[df_feat["_split"] == "train"].copy()
+    hmm_model = fit_hmm_features(hmm_train_input)
+
+    states = hmm_states_from_model(hmm_model, hmm_input)
+    proba = hmm_proba_from_model(hmm_model, hmm_input)
+    outputs = pd.concat([states, proba], axis=1).reset_index().rename(columns={"index": "_row"})
+
     merged = merge_dataframes(df_feat, outputs, on="_row", how="inner")
     merged = _build_targets(merged, horizon=TARGET_HORIZON)
     merged = merged.sort_values("date").reset_index(drop=True)
@@ -75,25 +93,37 @@ def prepare_data(
 
     proba_cols = [c for c in merged.columns if c.startswith("p_state_")]
     feature_cols = [*hmm_cols, *proba_cols]
-    data = merged[feature_cols + [target_col]].copy()
-    data[feature_cols] = data[feature_cols].apply(pd.to_numeric, errors="coerce")
-    data[target_col] = pd.to_numeric(data[target_col], errors="coerce")
-    data = data.dropna().reset_index(drop=True)
-    if len(data) < 100:
-        raise ValueError("Pas assez de données après nettoyage pour entraîner le modèle.")
 
-    split = int(len(data) * 0.8)
-    train_df = data.iloc[:split].copy()
-    val_df = data.iloc[split:].copy()
+    def _make_split_frame(split_name: str) -> pd.DataFrame:
+        frame = merged[merged["_split"] == split_name].copy()
+        if frame.empty:
+            raise ValueError(f"Split `{split_name}` est vide après merge HMM.")
+        frame = frame[["date", "_row", "_split", *feature_cols, target_col]].copy()
+        frame[feature_cols] = frame[feature_cols].apply(pd.to_numeric, errors="coerce")
+        frame[target_col] = pd.to_numeric(frame[target_col], errors="coerce")
+        frame = frame.dropna().reset_index(drop=True)
+        if frame.empty:
+            raise ValueError(f"Split `{split_name}` vide après dropna.")
+        return frame
 
-    X_train = torch.tensor(train_df[feature_cols].to_numpy(dtype=np.float32), dtype=torch.float32)
-    y_train = torch.tensor(train_df[target_col].to_numpy(dtype=np.float32).reshape(-1, 1), dtype=torch.float32)
-    X_val = torch.tensor(val_df[feature_cols].to_numpy(dtype=np.float32), dtype=torch.float32)
-    y_val = torch.tensor(val_df[target_col].to_numpy(dtype=np.float32).reshape(-1, 1), dtype=torch.float32)
+    train_df = _make_split_frame("train")
+    val_df = _make_split_frame("val")
+    test_df = _make_split_frame("test")
+
+    def _to_tensor(frame: pd.DataFrame) -> tuple[torch.Tensor, torch.Tensor]:
+        X = torch.tensor(frame[feature_cols].to_numpy(dtype=np.float32), dtype=torch.float32)
+        y = torch.tensor(frame[target_col].to_numpy(dtype=np.float32).reshape(-1, 1), dtype=torch.float32)
+        return X, y
+
+    X_train, y_train = _to_tensor(train_df)
+    X_val, y_val = _to_tensor(val_df)
+    X_test, y_test = _to_tensor(test_df)
 
     train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(TensorDataset(X_val, y_val), batch_size=BATCH_SIZE, shuffle=False)
-    return train_loader, val_loader, len(feature_cols), merged
+    test_loader = DataLoader(TensorDataset(X_test, y_test), batch_size=BATCH_SIZE, shuffle=False)
+    split_frames = {"train": train_df, "val": val_df, "test": test_df}
+    return train_loader, val_loader, test_loader, len(feature_cols), split_frames, merged
 
 
 class MLP(nn.Module):
@@ -164,11 +194,21 @@ def train_model(
     return model
 
 
+def predict(x_batch, model):
+    model.eval()
+    with torch.no_grad():
+        y_pred = model(x_batch)
+    return y_pred
+
+
 def main():
-    train_loader, val_loader, in_dim, merged = prepare_data()
+    train_loader, val_loader, test_loader, in_dim, split_frames, merged = prepare_data()
     model = train_model(train_loader, val_loader, in_dim=in_dim)
     final_val = _evaluate(model, val_loader, nn.MSELoss())
+    final_test = _evaluate(model, test_loader, nn.MSELoss())
     print(f"Final val MSE: {final_val:.6f}")
+    print(f"Final test MSE: {final_test:.6f}")
+    print("Split shapes:", {k: v.shape for k, v in split_frames.items()})
     print("Dataset with regimes shape:", merged.shape)
 
 
