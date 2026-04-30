@@ -8,11 +8,15 @@ from hmmlearn.hmm import GaussianHMM
 import matplotlib.pyplot as plt
 
 from features import features, compute_market_features
+from utils import read_parquet_dataset, train_val_test
 
 
 DATA_DIR = "data/cac40_daily.parquet"
+SEED = 1
+np.random.seed(1)
 
 HMM_FEATURES = [
+    "date",
     "adj_close",
     "ret_2",
     "ret_5",
@@ -40,33 +44,6 @@ HMM_FEATURES = [
     "vix_level",
     "market_breadth",
 ]
-
-def read_parquet_dataset(
-    base_dir: Path,
-    columns: list[str] | None = None,
-    filter_expr: ds.Expression | None = None,
-) -> pd.DataFrame:
-    """Read a hive-partitioned parquet dataset into a DataFrame.
-
-    Parameters
-    ----------
-    base_dir : Path
-        Dataset root directory.
-    columns : list[str] | None
-        Optional list of columns to project.
-    filter_expr : ds.Expression | None
-        Optional Arrow dataset filter expression.
-
-    Returns
-    -------
-    pd.DataFrame
-        Materialized data as a pandas DataFrame.
-    """
-    dataset = ds.dataset(str(base_dir), format="parquet", partitioning="hive")
-    if not dataset or dataset is None:
-        raise ValueError("dataset empty")
-    table = dataset.to_table(filter=filter_expr, columns=columns)
-    return table.to_pandas()
 
 
 def standardise(df):
@@ -123,18 +100,6 @@ def compute_trend_score(returns: pd.DataFrame, window: int = 10) -> pd.DataFrame
     return score
 
 
-def train_val_test(df, split_index1: float = 0.7, split_index2: float = 0.85):
-    n = len(df)
-    i1 = int(n * split_index1)
-    i2 = int(n * split_index2)
-
-    train = df.iloc[:i1].copy()
-    val = df.iloc[i1:i2].copy()
-    test = df.iloc[i2:].copy()
-    return train, val, test
-
-
-
 def compute_realised_vol(returns : pd.DataFrame, window : int = 10) -> pd.DataFrame:
     if returns is None or returns.empty:
         return pd.DataFrame()
@@ -165,7 +130,7 @@ def fit_hmm_features(X: pd.DataFrame, n_states: int = 4, covariance_type: str = 
     if X.empty:
         raise ValueError("X has only NaNs after dropna.")
     
-    model = GaussianHMM(n_components= n_states, covariance_type= covariance_type, n_iter=200)
+    model = GaussianHMM(n_components= n_states, covariance_type= covariance_type, n_iter=200, random_state=SEED)
     model.fit(X.to_numpy())
     return model
 
@@ -211,7 +176,15 @@ def build_regime_outputs(model, df_z: pd.DataFrame) -> pd.DataFrame:
 def regime_pipeline(df):
     hmm = fit_regime_model(df)
     outputs = build_regime_outputs(hmm, df)
-    outputs = outputs.reset_index().rename(columns={"index": "date"})
+    outputs = outputs.reset_index().rename(columns={"index": "_row"})
+    proba_cols = [c for c in outputs.columns if c.startswith("p_state_")]
+
+    if "date" in df.columns:
+        outputs["date"] = pd.to_datetime(df.loc[outputs["_row"], "date"].to_numpy(), errors="coerce")
+        outputs = outputs[["date", "_row", "state", *proba_cols]]
+    else:
+        outputs = outputs[["_row", "state", *proba_cols]]
+
     print("outputs shape:", outputs.shape)
     print(outputs.head(3))
     print(outputs.dtypes)
